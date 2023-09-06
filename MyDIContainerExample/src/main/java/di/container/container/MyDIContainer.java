@@ -5,39 +5,72 @@ import di.container.annotation.Autowired;
 import di.container.annotation.Component;
 import di.container.annotation.PostConstructor;
 import di.container.annotation.Qualifier;
+import di.container.postprocessors.AfterAdditionHandler;
+import di.container.postprocessors.BeforeAdditionHandler;
+import javassist.bytecode.SignatureAttribute;
 import org.reflections.Reflections;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.reflections.scanners.SubTypesScanner;
+import org.reflections.scanners.TypeAnnotationsScanner;
+import org.reflections.util.ClasspathHelper;
+import org.reflections.util.ConfigurationBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class MyDIContainer {
 
+    private boolean isInitialized = false;
     private final Logger logger = LoggerFactory.getLogger(MyDIContainer.class);
 
     private final Map<Class<?>, Object> beans = new ConcurrentHashMap();
     private final Reflections reflections;
     private final String rootPackageName; // определяем корневой пакет приложения
 
+    private final List<BeforeAdditionHandler> beforeAdditionHandlers = new ArrayList<>();
+    private final List<AfterAdditionHandler> afterAdditionHandlers = new ArrayList<>();
+
+    private Deque<Class<?>> creationStack = new LinkedList<>();
+
+    private static final ClassLoader DEFAULT_CLASS_LOADER = MyDIContainer.class.getClassLoader();
+
     public MyDIContainer(String rootPackage) {
         this.rootPackageName = rootPackage;
-        this.reflections = new Reflections(rootPackageName);
-        try {
-            // Находим все классы с аннотацией @Component
-            Set<Class<?>> componentClasses = reflections.getTypesAnnotatedWith(Component.class);
-            for (Class<?> componentClass : componentClasses) {
-                createBean(componentClass);
+        // используем наш загрузчик классов для Reflections
+        this.reflections = new Reflections(new ConfigurationBuilder()
+                .setUrls(ClasspathHelper.forPackage(rootPackageName, DEFAULT_CLASS_LOADER))
+                .setScanners(new SubTypesScanner(false), new TypeAnnotationsScanner())
+                .addClassLoaders(DEFAULT_CLASS_LOADER));
+    }
+
+    public void addBeforeAdditionHandler(BeforeAdditionHandler handler) {
+        beforeAdditionHandlers.add(handler);
+    }
+
+    public void addAfterAdditionHandler(AfterAdditionHandler handler) {
+        afterAdditionHandlers.add(handler);
+    }
+
+    // добавляем инициализацию контейнера
+    public void initialize() {
+        if (!isInitialized) {
+            try {
+                // Находим все классы с аннотацией @Component
+                Set<Class<?>> componentClasses = reflections.getTypesAnnotatedWith(Component.class);
+                for (Class<?> componentClass : componentClasses) {
+                    createBean(componentClass);
+                }
+            } catch (Exception e) {
+                logger.error("Ошибка при создании экземпляра" + e);
             }
-        } catch (Exception e) {
-            logger.error("Ошибка при создании экземпляра" + e);
         }
 
+        isInitialized = true;
     }
 
     private Class<?> findImplementation(Class<?> interfaceClass, String qualifierValue) {
@@ -60,6 +93,14 @@ public class MyDIContainer {
 
 
     private <T> T createBean(Class<T> clazz) throws Exception {
+
+        // Проверка на круговую зависимость
+        if (creationStack.contains(clazz)) {
+            String errorMessage = "Циклическая зависимость обнаружена для класса: " + clazz.getName() + ". Стек: " + creationStack;
+            logger.error(errorMessage);
+            throw new RuntimeException(errorMessage);
+        }
+        creationStack.push(clazz);
 
         //Если объект уже создан, возвращаем его
         if (beans.containsKey(clazz)) {
@@ -103,7 +144,18 @@ public class MyDIContainer {
 
         // Создаем экземпляр объекта
         T instance = (T) selectedConstructor.newInstance(args);
+
+        // добавляем обработчики Before
+        for (BeforeAdditionHandler handler : beforeAdditionHandlers) {
+            handler.handle(instance);
+        }
+
         beans.put(clazz, instance);
+
+        // добавляем обработчики After
+        for (AfterAdditionHandler handler : afterAdditionHandlers) {
+            handler.handle(instance);
+        }
 
         // Вызываем методы с аннотацией @PostConstructor
         for (Method method : clazz.getMethods()) {
@@ -112,10 +164,16 @@ public class MyDIContainer {
             }
         }
 
+        creationStack.pop();
+
         return instance;
     }
 
     public <T> T getBean(Class<T> clazz) {
+        if (!isInitialized) {
+            initialize();
+        }
+
         return (T) beans.get(clazz);
     }
 }
